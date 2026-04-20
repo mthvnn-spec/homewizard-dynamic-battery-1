@@ -1,0 +1,1081 @@
+# ============================================================
+#  Tibber + HomeWizard Battery — Hybrid YAML + Pyscript  v25
+#  ──────────────────────────────────────────────────────────
+#  Changes vs v24:
+#    - Opportunistic charging now requires a profitable DP schedule
+#      (no longer charges blindly at cheap prices with no sell path)
+#    - Solar headroom disabled while saldering/netting is active;
+#      only activates when saldering is off or tomorrow has neg prices
+#    - Terminal-value DP replaces fixed margin_penalty per discharge
+#    - Profit tracking is saldering-aware: solar opportunity cost uses
+#      retail price when saldering=on, export_value when saldering=off
+#    - Added battery_export_value_per_kwh helper (default 0.09 EUR/kWh)
+#    - Solar forecast accuracy ratio corrects tomorrow's headroom calc
+#    - DP charge cost now uses grid-side kWh (/ charge_efficiency)
+#    - min_price_spread now enforced in profitability check
+#
+#  Pyscript: /config/pyscript/battery_scheduler.py
+# ============================================================
+
+input_boolean:
+  battery_smart_control_enabled:
+    name: "Battery Smart Control Enabled"
+    icon: mdi:battery-sync
+
+  battery_saldering_enabled:
+    name: "Battery Saldering/Netting Active"
+    icon: mdi:transmission-tower-export
+
+input_text:
+  battery_debug_stage:
+    name: "Battery Debug Stage"
+    max: 255
+
+  battery_debug_error:
+    name: "Battery Debug Error"
+    max: 255
+
+  battery_last_mode:
+    name: "Battery Last Mode"
+    initial: "unknown"
+    max: 50
+
+  battery_charge_slots:
+    name: "Battery Charge Slots"
+    max: 255
+    icon: mdi:battery-charging
+
+  battery_discharge_slots:
+    name: "Battery Discharge Slots"
+    max: 255
+    icon: mdi:battery-arrow-down
+
+  battery_charge_slots_detail:
+    name: "Battery Charge Slots Detail"
+    max: 255
+    icon: mdi:battery-charging
+
+  battery_discharge_slots_detail:
+    name: "Battery Discharge Slots Detail"
+    max: 255
+    icon: mdi:battery-arrow-down
+
+  battery_tibber_prices_cache_1:
+    name: "Tibber Prices Cache 1"
+    max: 255
+    icon: mdi:cash-multiple
+
+  battery_tibber_prices_cache_2:
+    name: "Tibber Prices Cache 2"
+    max: 255
+    icon: mdi:cash-multiple
+
+  battery_tibber_prices_cache_3:
+    name: "Tibber Prices Cache 3"
+    max: 255
+    icon: mdi:cash-multiple
+
+  battery_tibber_prices_cache_4:
+    name: "Tibber Prices Cache 4"
+    max: 255
+    icon: mdi:cash-multiple
+
+  battery_tibber_prices_cache_5:
+    name: "Tibber Prices Cache 5"
+    max: 255
+    icon: mdi:cash-multiple
+
+  battery_debug_summary:
+    name: "Battery Debug Summary"
+    max: 255
+    icon: mdi:text-box-search
+
+  battery_debug_reason:
+    name: "Battery Debug Reason"
+    max: 255
+    icon: mdi:comment-search
+
+  battery_debug_slot_now:
+    name: "Battery Debug Current Slot"
+    max: 50
+    icon: mdi:clock-outline
+
+  battery_debug_charge_times:
+    name: "Battery Debug Charge Times"
+    max: 255
+    icon: mdi:battery-charging-outline
+
+  battery_debug_discharge_times:
+    name: "Battery Debug Discharge Times"
+    max: 255
+    icon: mdi:battery-arrow-down-outline
+
+  # Entity ID of your inverter/solar daily energy sensor (kWh).
+  # Used to compute forecast accuracy. Set to your actual sensor, e.g.:
+  #   sensor.solcast_pv_forecast_actual_today
+  #   sensor.solar_inverter_energy_today
+  battery_solar_actual_sensor:
+    name: "Solar Actual Production Sensor ID"
+    initial: "sensor.solcast_pv_forecast_actual_today"
+    max: 100
+    icon: mdi:solar-panel
+
+input_number:
+  tibber_charge_ceiling:
+    name: "Tibber Charge Ceiling"
+    min: -1
+    max: 5
+    step: 0.0001
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:arrow-down-circle
+
+  tibber_discharge_floor:
+    name: "Tibber Discharge Floor"
+    min: -1
+    max: 5
+    step: 0.0001
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:arrow-up-circle
+
+  tibber_expected_profit:
+    name: "Tibber Expected Profit per kWh"
+    min: -1
+    max: 1
+    step: 0.0001
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:cash-plus
+
+  battery_min_profit_threshold:
+    name: "Minimum Profit Threshold"
+    min: 0
+    max: 0.1
+    step: 0.001
+    initial: 0.05
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:cash-check
+
+  battery_schedule_safety_margin:
+    name: "Schedule Safety Margin"
+    min: 0
+    max: 0.05
+    step: 0.001
+    initial: 0.02
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:shield-check
+
+  battery_schedule_min_total_value:
+    name: "Schedule Min Total Value"
+    min: 0
+    max: 1
+    step: 0.01
+    initial: 0.03
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-multiple
+
+  battery_min_discharge_soc:
+    name: "Minimum Discharge SOC"
+    min: 0
+    max: 30
+    step: 1
+    initial: 5
+    unit_of_measurement: "%"
+    icon: mdi:battery-low
+
+  battery_morning_reserve_fraction:
+    name: "Morning Reserve Fraction"
+    min: 0
+    max: 0.8
+    step: 0.05
+    initial: 0.35
+    unit_of_measurement: "ratio"
+    icon: mdi:weather-sunset-up
+
+  battery_morning_reserve_min_slots:
+    name: "Morning Reserve Min Slots"
+    min: 0
+    max: 12
+    step: 1
+    initial: 2
+    unit_of_measurement: "slots"
+    icon: mdi:counter
+
+  battery_morning_peak_end_hour:
+    name: "Morning Peak End Hour"
+    min: 1
+    max: 24
+    step: 1
+    initial: 10
+    unit_of_measurement: "h"
+    icon: mdi:clock-end
+
+  battery_last_soc:
+    name: "Battery Last SOC"
+    min: 0
+    max: 100
+    step: 0.1
+    unit_of_measurement: "%"
+    icon: mdi:battery
+
+  battery_solar_soc_pct:
+    name: "Battery Solar SOC Percentage"
+    min: 0
+    max: 100
+    step: 0.1
+    unit_of_measurement: "%"
+    icon: mdi:solar-power-variant
+
+  battery_energy_grid_charged:
+    name: "Battery Energy Grid Charged"
+    min: 0
+    max: 1000
+    step: 0.001
+    unit_of_measurement: "kWh"
+    icon: mdi:transmission-tower
+
+  battery_energy_solar_charged:
+    name: "Battery Energy Solar Charged"
+    min: 0
+    max: 1000
+    step: 0.001
+    unit_of_measurement: "kWh"
+    icon: mdi:solar-power
+
+  battery_energy_discharged:
+    name: "Battery Energy Discharged"
+    min: 0
+    max: 1000
+    step: 0.001
+    unit_of_measurement: "kWh"
+    icon: mdi:battery-arrow-down
+
+  battery_cumulative_grid_cost:
+    name: "Battery Cumulative Grid Cost"
+    min: 0
+    max: 1000
+    step: 0.0001
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-minus
+
+  battery_cumulative_discharge_revenue:
+    name: "Battery Cumulative Discharge Revenue"
+    min: 0
+    max: 1000
+    step: 0.0001
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-plus
+
+  battery_actual_profit:
+    name: "Battery Actual Profit"
+    min: -100
+    max: 100
+    step: 0.0001
+    unit_of_measurement: "EUR"
+    icon: mdi:chart-line
+
+  battery_profit_day_1:
+    name: "Battery Profit Day -1"
+    min: -10
+    max: 10
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-clock
+
+  battery_profit_day_2:
+    name: "Battery Profit Day -2"
+    min: -10
+    max: 10
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-clock
+
+  battery_profit_day_3:
+    name: "Battery Profit Day -3"
+    min: -10
+    max: 10
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-clock
+
+  battery_profit_day_4:
+    name: "Battery Profit Day -4"
+    min: -10
+    max: 10
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-clock
+
+  battery_profit_day_5:
+    name: "Battery Profit Day -5"
+    min: -10
+    max: 10
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-clock
+
+  battery_profit_day_6:
+    name: "Battery Profit Day -6"
+    min: -10
+    max: 10
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-clock
+
+  battery_profit_day_7:
+    name: "Battery Profit Day -7"
+    min: -10
+    max: 10
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:cash-clock
+
+  battery_profit_week_total:
+    name: "Battery Profit Week Total"
+    min: -100
+    max: 100
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:calendar-week
+
+  battery_profit_month_total:
+    name: "Battery Profit Month Total"
+    min: -100
+    max: 100
+    step: 0.0001
+    initial: 0
+    unit_of_measurement: "EUR"
+    icon: mdi:calendar-month
+
+  battery_debug_total_value:
+    name: "Battery Debug Total Value"
+    min: -10
+    max: 10
+    step: 0.0001
+    unit_of_measurement: "EUR"
+    icon: mdi:cash
+
+  battery_debug_price_spread:
+    name: "Battery Debug Price Spread"
+    min: -1
+    max: 5
+    step: 0.0001
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:chart-line
+
+  battery_debug_live_price:
+    name: "Battery Debug Live Price"
+    min: -1
+    max: 5
+    step: 0.0001
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:flash
+
+  battery_debug_soc:
+    name: "Battery Debug SOC"
+    min: 0
+    max: 100
+    step: 0.1
+    unit_of_measurement: "%"
+    icon: mdi:battery
+
+  battery_debug_expected_profit:
+    name: "Battery Debug Expected Profit"
+    min: -1
+    max: 1
+    step: 0.0001
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:cash-plus
+
+  battery_debug_charge_count:
+    name: "Battery Debug Charge Count"
+    min: 0
+    max: 50
+    step: 1
+    icon: mdi:counter
+
+  battery_debug_discharge_count:
+    name: "Battery Debug Discharge Count"
+    min: 0
+    max: 50
+    step: 1
+    icon: mdi:counter
+
+  battery_capacity_kwh:
+    name: "Battery Capacity"
+    min: 0.5
+    max: 20
+    step: 0.1
+    initial: 2.7
+    unit_of_measurement: "kWh"
+    icon: mdi:battery-high
+
+  battery_max_charge_slot_kwh:
+    name: "Battery Max Charge per Slot"
+    min: 0.01
+    max: 1
+    step: 0.001
+    initial: 0.189
+    unit_of_measurement: "kWh"
+    icon: mdi:battery-charging
+
+  battery_max_discharge_slot_kwh:
+    name: "Battery Max Discharge per Slot"
+    min: 0.01
+    max: 1
+    step: 0.001
+    initial: 0.189
+    unit_of_measurement: "kWh"
+    icon: mdi:battery-arrow-down
+
+  battery_charge_efficiency:
+    name: "Battery Charge Efficiency"
+    min: 0.5
+    max: 1
+    step: 0.01
+    initial: 0.75
+    unit_of_measurement: "ratio"
+    icon: mdi:percent
+
+  battery_discharge_efficiency:
+    name: "Battery Discharge Efficiency"
+    min: 0.5
+    max: 1
+    step: 0.01
+    initial: 0.95
+    unit_of_measurement: "ratio"
+    icon: mdi:percent
+
+  battery_min_price_spread:
+    name: "Battery Minimum Price Spread"
+    min: 0
+    max: 1
+    step: 0.01
+    initial: 0.04
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:chart-line
+
+  # What solar export is worth when saldering is OFF (post-Jan 2027).
+  # Used as the opportunity cost of solar charged into the battery instead
+  # of the full retail import price. Typical feed-in tariff: ~0.09 EUR/kWh.
+  # Has no effect while battery_saldering_enabled is on.
+  battery_export_value_per_kwh:
+    name: "Battery Export Value per kWh"
+    min: 0
+    max: 1
+    step: 0.001
+    initial: 0.09
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:transmission-tower-export
+
+  # Charges from grid when live price <= this threshold, but only when
+  # the overall DP schedule is already profitable. Prevents filling the
+  # battery at cheap prices that still have no good discharge path.
+  # Set to 0 to disable. Default 0.14 = 14 ct/kWh.
+  battery_opportunistic_charge_threshold:
+    name: "Battery Opportunistic Charge Threshold"
+    min: 0
+    max: 0.5
+    step: 0.01
+    initial: 0.14
+    unit_of_measurement: "EUR/kWh"
+    icon: mdi:lightning-bolt-circle
+
+  # Stores today's Solcast p50 forecast at midnight so it can be
+  # compared against actual production at end of day.
+  battery_solcast_today_forecast_cached:
+    name: "Solcast Today Forecast (Cached)"
+    min: 0
+    max: 100
+    step: 0.01
+    initial: 0
+    unit_of_measurement: "kWh"
+    icon: mdi:solar-power-variant
+
+  # Rolling accuracy ratio: actual / forecast, exponentially smoothed (alpha=0.3).
+  # Applied to tomorrow's forecast before the solar headroom calculation.
+  # 1.0 = forecast accurate, 0.6 = actual consistently 60% of forecast.
+  battery_solar_forecast_accuracy:
+    name: "Solar Forecast Accuracy Ratio"
+    min: 0.1
+    max: 2.0
+    step: 0.01
+    initial: 1.0
+    unit_of_measurement: "ratio"
+    icon: mdi:weather-sunny-alert
+
+  # Persists the last valid daytime Solcast forecast_tomorrow reading.
+  # Resets to 0 at midnight alongside the other daily counters.
+  battery_solcast_tomorrow_cached:
+    name: "Solcast Tomorrow Forecast (Cached)"
+    min: 0
+    max: 100
+    step: 0.01
+    initial: 0
+    unit_of_measurement: "kWh"
+    icon: mdi:solar-power-variant
+
+script:
+  battery_notify:
+    alias: "Battery | Notify Both Phones"
+    fields:
+      title:
+        description: "Notification title"
+      message:
+        description: "Notification body"
+    sequence:
+      - action: notify.mobile_app_mathis_iphone
+        data:
+          title: "{{ title }}"
+          message: "{{ message }}"
+
+automation:
+  - id: battery_fetch_prices_daily
+    alias: "Battery | Fetch Prices Daily at 13:05 (with 30-min retry)"
+    description: >
+      Fetches 48-hour Tibber price forecast at 13:05, right after
+      Tibber publishes tomorrow's prices at 13:00. If fetch fails
+      or cache is empty, retries every 30 minutes until successful.
+      Stores as compact data in helpers for pyscript.
+    trigger:
+      - platform: time
+        at: "13:05:00"
+        id: daily
+      - platform: time_pattern
+        minutes: "6"
+        id: retry_06
+      - platform: time_pattern
+        minutes: "36"
+        id: retry_36
+    condition:
+      - condition: state
+        entity_id: input_boolean.battery_smart_control_enabled
+        state: "on"
+      - condition: template
+        value_template: >
+          {% set ns = namespace(cache='') %}
+          {% for i in range(1, 6) %}
+            {% set chunk = states('input_text.battery_tibber_prices_cache_' ~ i) %}
+            {% if chunk not in ['unknown', 'unavailable', 'none', 'None'] %}
+              {% set ns.cache = ns.cache ~ chunk %}
+            {% endif %}
+          {% endfor %}
+          {% set is_empty = ';' not in ns.cache or ns.cache | length < 40 %}
+          {% set count = 0 %}
+          {% set has_tomorrow = false %}
+          {% if not is_empty %}
+            {% set parts = ns.cache.split(';', 1) %}
+            {% if parts | length == 2 and parts[0] | length == 16 %}
+              {% set values = parts[1].split(',') | reject('equalto', '') | list %}
+              {% set count = values | length %}
+              {% if count > 0 %}
+                {% set start_dt = as_datetime(parts[0] ~ ':00') %}
+                {% if start_dt is not none %}
+                  {% set end_dt = start_dt + timedelta(minutes=15 * (count - 1)) %}
+                  {% set has_tomorrow = end_dt.date() > now().date() %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endif %}
+          {% set after_publish_time = now().hour >= 13 %}
+          {% set cache_incomplete = count < 160 %}
+          {% set stale_after_publish = after_publish_time and (not has_tomorrow or cache_incomplete) %}
+          {{ trigger.id == 'daily' or is_empty or stale_after_publish }}
+    action:
+      - action: tibber.get_prices
+        data:
+          start: "{{ today_at('00:00') }}"
+          end: "{{ today_at('00:00') + timedelta(days=2) }}"
+        response_variable: tibber_response
+
+      - variables:
+          fetched_prices: "{{ (tibber_response.prices.values() | first) | default([]) }}"
+          compact_prices: >
+            {% if fetched_prices | length > 0 %}
+              {% set ns = namespace(items=[]) %}
+              {% for slot in fetched_prices %}
+                {% set p = (slot.price | float(0) * 10000) | round(0) | int %}
+                {% set ns.items = ns.items + [p] %}
+              {% endfor %}
+              {{ fetched_prices[0].start_time[0:16] ~ ';' ~ (ns.items | join(',')) }}
+            {% else %}
+            {% endif %}
+
+      - condition: template
+        value_template: "{{ fetched_prices | length > 0 }}"
+
+      - repeat:
+          count: 5
+          sequence:
+            - service: input_text.set_value
+              data:
+                entity_id: "{{ 'input_text.battery_tibber_prices_cache_' ~ repeat.index }}"
+                value: >
+                  {{ compact_prices[((repeat.index - 1) * 255):(repeat.index * 255)] }}
+
+      - action: script.battery_notify
+        data:
+          title: "📊 Tibber Prices Cached"
+          message: >
+            Fetched {{ fetched_prices | length }} price slots.
+            Next retry: 30 mins if empty.
+
+  - id: battery_price_control_15min
+    alias: "Battery | Run Pyscript Scheduler"
+    description: >
+      Calls pyscript.battery_schedule_run every 15 min.
+      All scheduling logic lives in pyscript/battery_scheduler.py.
+    trigger:
+      - platform: time_pattern
+        minutes: "1"
+      - platform: time_pattern
+        minutes: "16"
+      - platform: time_pattern
+        minutes: "31"
+      - platform: time_pattern
+        minutes: "46"
+      - platform: state
+        entity_id: input_boolean.battery_smart_control_enabled
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.battery_smart_control_enabled
+        state: "on"
+    action:
+      - action: pyscript.battery_schedule_run
+
+  - id: battery_cache_solcast_forecast
+    alias: "Battery | Cache Solcast Tomorrow Forecast"
+    description: >
+      Whenever the Solcast forecast_tomorrow sensor has a valid reading,
+      write it to the cache. Allows 0.0 through so downward revisions
+      are captured. Also polls hourly in case state didn't change.
+    trigger:
+      - platform: state
+        entity_id: sensor.solcast_pv_forecast_forecast_tomorrow
+      - platform: time_pattern
+        hours: "/1"
+    condition:
+      - condition: template
+        value_template: >
+          {{ states('sensor.solcast_pv_forecast_forecast_tomorrow')
+             not in ['unavailable', 'unknown', 'none', 'None', ''] }}
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_solcast_tomorrow_cached
+        data:
+          value: >
+            {{ states('sensor.solcast_pv_forecast_forecast_tomorrow') | float(0) | round(2) }}
+
+  - id: battery_track_energy_flows_v21
+    alias: "Battery | Track Energy Flows v21"
+    description: >
+      Netting-aware energy inventory and profit tracking.
+      Grid cost uses energy_kwh / charge_efficiency (actual grid draw).
+      Discharge revenue uses delivered_kwh = battery_kwh × discharge_efficiency.
+      Solar charge is valued at live market price as opportunity cost.
+    trigger:
+      - platform: time_pattern
+        minutes: "3"
+      - platform: time_pattern
+        minutes: "18"
+      - platform: time_pattern
+        minutes: "33"
+      - platform: time_pattern
+        minutes: "48"
+    condition:
+      - condition: state
+        entity_id: input_boolean.battery_smart_control_enabled
+        state: "on"
+      - condition: template
+        value_template: >
+          {{ states('sensor.plug_in_battery_state_of_charge') not in ['unavailable', 'unknown'] }}
+    action:
+      - variables:
+          current_soc: "{{ states('sensor.plug_in_battery_state_of_charge') | float(50) }}"
+          last_soc: "{{ states('input_number.battery_last_soc') | float(current_soc) }}"
+          soc_delta: "{{ current_soc - last_soc }}"
+
+          capacity_kwh: "{{ states('input_number.battery_capacity_kwh') | float(2.7) }}"
+          charge_efficiency: "{{ states('input_number.battery_charge_efficiency') | float(0.75) }}"
+          discharge_efficiency: "{{ states('input_number.battery_discharge_efficiency') | float(0.95) }}"
+
+          energy_kwh: "{{ ((soc_delta / 100) * (capacity_kwh | float)) | round(5) }}"
+
+          mode: "{{ states('input_text.battery_last_mode') }}"
+          price: "{{ states('sensor.home54_electricity_price') | float(0) }}"
+
+          is_charging: "{{ energy_kwh | float > 0.01 }}"
+          is_discharging: "{{ energy_kwh | float < -0.01 }}"
+
+          is_solar_charge: "{{ is_charging and mode == 'zero_charge_only' }}"
+          is_grid_charge: "{{ is_charging and mode == 'to_full' }}"
+
+          saldering_on: "{{ is_state('input_boolean.battery_saldering_enabled', 'on') }}"
+          export_value: "{{ states('input_number.battery_export_value_per_kwh') | float(0.09) }}"
+          solar_opportunity_price: "{{ price if saldering_on else export_value }}"
+
+          solar_soc_pct: "{{ states('input_number.battery_solar_soc_pct') | float(0) }}"
+          last_total_kwh: "{{ (((last_soc | float) / 100) * (capacity_kwh | float)) | round(5) }}"
+          solar_kwh_in_battery: "{{ (((solar_soc_pct | float) / 100) * (((last_soc | float) / 100) * (capacity_kwh | float))) | round(5) }}"
+
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ is_solar_charge }}"
+            sequence:
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_energy_solar_charged
+                data:
+                  value: "{{ states('input_number.battery_energy_solar_charged') | float(0) + (energy_kwh | float) }}"
+
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_cumulative_grid_cost
+                data:
+                  value: >
+                    {{ states('input_number.battery_cumulative_grid_cost') | float(0)
+                       + (((energy_kwh | float) / (charge_efficiency | float(0.75))) * (solar_opportunity_price | float)) }}
+
+              - variables:
+                  new_solar_kwh: "{{ (solar_kwh_in_battery | float) + (energy_kwh | float) }}"
+                  new_total_kwh: "{{ (((current_soc | float) / 100) * (capacity_kwh | float)) | round(5) }}"
+
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_solar_soc_pct
+                data:
+                  value: >
+                    {{ [(((new_solar_kwh | float) / (new_total_kwh | float) * 100)
+                        if (new_total_kwh | float) > 0 else 0), 100] | min | round(1) }}
+
+          - conditions:
+              - condition: template
+                value_template: "{{ is_grid_charge }}"
+            sequence:
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_energy_grid_charged
+                data:
+                  value: "{{ states('input_number.battery_energy_grid_charged') | float(0) + (energy_kwh | float) }}"
+
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_cumulative_grid_cost
+                data:
+                  value: >
+                    {{ states('input_number.battery_cumulative_grid_cost') | float(0)
+                       + (((energy_kwh | float) / (charge_efficiency | float(0.75))) * (price | float)) }}
+
+              - variables:
+                  new_total_kwh: "{{ (((current_soc | float) / 100) * (capacity_kwh | float)) | round(5) }}"
+
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_solar_soc_pct
+                data:
+                  value: >
+                    {{ [(((solar_kwh_in_battery | float) / (new_total_kwh | float) * 100)
+                        if (new_total_kwh | float) > 0 else 0), 100] | min | round(1) }}
+
+          - conditions:
+              - condition: template
+                value_template: "{{ is_discharging }}"
+            sequence:
+              - variables:
+                  discharge_kwh_battery: "{{ (-energy_kwh | float) }}"
+                  delivered_kwh: "{{ ((-energy_kwh | float) * (discharge_efficiency | float(0.95))) | round(5) }}"
+                  last_total_kwh_safe: "{{ [last_total_kwh | float, 0.00001] | max }}"
+                  solar_share: "{{ [(solar_kwh_in_battery | float) / (last_total_kwh_safe | float), 1] | min }}"
+                  solar_used_kwh: "{{ ((discharge_kwh_battery | float) * (solar_share | float)) | round(5) }}"
+
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_energy_discharged
+                data:
+                  value: "{{ states('input_number.battery_energy_discharged') | float(0) + (discharge_kwh_battery | float) }}"
+
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_cumulative_discharge_revenue
+                data:
+                  value: >
+                    {{ states('input_number.battery_cumulative_discharge_revenue') | float(0)
+                       + ((delivered_kwh | float) * (price | float)) }}
+
+              - variables:
+                  new_solar_kwh: "{{ [(solar_kwh_in_battery | float) - (solar_used_kwh | float), 0] | max }}"
+                  new_total_kwh: "{{ [(((current_soc | float) / 100) * (capacity_kwh | float)), 0] | max }}"
+
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.battery_solar_soc_pct
+                data:
+                  value: >
+                    {{ [(((new_solar_kwh | float) / (new_total_kwh | float) * 100)
+                        if (new_total_kwh | float) > 0 else 0), 100] | min | round(1) }}
+
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_actual_profit
+        data:
+          value: >
+            {{ (states('input_number.battery_cumulative_discharge_revenue') | float(0)
+              - states('input_number.battery_cumulative_grid_cost') | float(0)) | round(4) }}
+
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_last_soc
+        data:
+          value: "{{ current_soc }}"
+
+  - id: battery_snapshot_daily_profit
+    alias: "Battery | Snapshot Daily Profit"
+    trigger:
+      - platform: time
+        at: "23:59:30"
+    action:
+      - variables:
+          today: "{{ states('input_number.battery_actual_profit') | float(0) }}"
+          d1: "{{ states('input_number.battery_profit_day_1') | float(0) }}"
+          d2: "{{ states('input_number.battery_profit_day_2') | float(0) }}"
+          d3: "{{ states('input_number.battery_profit_day_3') | float(0) }}"
+          d4: "{{ states('input_number.battery_profit_day_4') | float(0) }}"
+          d5: "{{ states('input_number.battery_profit_day_5') | float(0) }}"
+          d6: "{{ states('input_number.battery_profit_day_6') | float(0) }}"
+          month_total: "{{ states('input_number.battery_profit_month_total') | float(0) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_day_7
+        data:
+          value: "{{ d6 | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_day_6
+        data:
+          value: "{{ d5 | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_day_5
+        data:
+          value: "{{ d4 | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_day_4
+        data:
+          value: "{{ d3 | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_day_3
+        data:
+          value: "{{ d2 | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_day_2
+        data:
+          value: "{{ d1 | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_day_1
+        data:
+          value: "{{ today | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_week_total
+        data:
+          value: "{{ (today + d1 + d2 + d3 + d4 + d5 + d6) | round(4) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_profit_month_total
+        data:
+          value: >
+            {% if now().day == 1 %}{{ today | round(4) }}
+            {% else %}{{ (month_total + today) | round(4) }}{% endif %}
+
+  - id: battery_reset_daily_counters
+    alias: "Battery | Reset Daily Counters"
+    trigger:
+      - platform: time
+        at: "00:00:00"
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id:
+            - input_number.battery_energy_grid_charged
+            - input_number.battery_energy_solar_charged
+            - input_number.battery_energy_discharged
+            - input_number.battery_cumulative_grid_cost
+            - input_number.battery_cumulative_discharge_revenue
+            - input_number.battery_actual_profit
+            - input_number.battery_solcast_tomorrow_cached
+        data:
+          value: 0
+
+  - id: battery_tomorrow_prices_arrived
+    alias: "Battery | Tomorrow Prices Arrived"
+    trigger:
+      - platform: time
+        at: "13:05:00"
+    condition:
+      - condition: state
+        entity_id: input_boolean.battery_smart_control_enabled
+        state: "on"
+    action:
+      - action: tibber.get_prices
+        data:
+          start: "{{ now() }}"
+          end: "{{ today_at('00:00') + timedelta(days=2) }}"
+        response_variable: tibber_response
+      - variables:
+          all_raw: "{{ tibber_response.prices.values() | first }}"
+          tomorrow_str: "{{ (now() + timedelta(days=1)).strftime('%Y-%m-%d') }}"
+          today_str: "{{ now().strftime('%Y-%m-%d') }}"
+          now_str: "{{ now().strftime('%Y-%m-%dT%H:%M:%S') }}"
+          tomorrow: >
+            {% set ns = namespace(r=[]) %}
+            {% for s in all_raw %}{% if tomorrow_str in s.start_time %}{% set ns.r = ns.r + [s] %}{% endif %}{% endfor %}
+            {{ ns.r }}
+          today_remaining: >
+            {% set ns = namespace(r=[]) %}
+            {% for s in all_raw %}{% if today_str in s.start_time and s.start_time[:19] >= now_str %}{% set ns.r = ns.r + [s] %}{% endif %}{% endfor %}
+            {{ ns.r }}
+      - condition: template
+        value_template: "{{ tomorrow | length > 0 }}"
+      - action: script.battery_notify
+        data:
+          title: "📊 Tomorrow's Prices"
+          message: >
+            Today remaining: {{ (today_remaining | map(attribute='price') | min * 100) | round(1) }}–{{ (today_remaining | map(attribute='price') | max * 100) | round(1) }} ct
+            Tomorrow: {{ (tomorrow | map(attribute='price') | min * 100) | round(1) }}–{{ (tomorrow | map(attribute='price') | max * 100) | round(1) }} ct
+
+  - id: battery_smart_control_disabled
+    alias: "Battery | Return to Hold When Disabled"
+    trigger:
+      - platform: state
+        entity_id: input_boolean.battery_smart_control_enabled
+        to: "off"
+    action:
+      - action: select.select_option
+        target:
+          entity_id: select.p1_meter_battery_group_mode
+        data:
+          option: zero_charge_only
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.battery_last_mode
+        data:
+          value: "disabled"
+      - action: script.battery_notify
+        data:
+          title: "🔋 Battery Smart Control → OFF"
+          message: "Returned to hold mode."
+
+  - id: battery_soc_sensor_validation
+    alias: "Battery | SOC Sensor Validation"
+    trigger:
+      - platform: state
+        entity_id: sensor.plug_in_battery_state_of_charge
+        to: "unavailable"
+        for:
+          minutes: 5
+      - platform: state
+        entity_id: sensor.plug_in_battery_state_of_charge
+        to: "unknown"
+        for:
+          minutes: 5
+    condition:
+      - condition: state
+        entity_id: input_boolean.battery_smart_control_enabled
+        state: "on"
+    action:
+      - action: notify.mobile_app_mathis_iphone
+        data:
+          title: "⚠️ Battery SOC Unavailable"
+          message: "SOC sensor down 5+ min. Using 50% fallback."
+          data:
+            tag: "battery_soc_warning"
+            actions:
+              - action: "DISABLE_BATTERY_CONTROL"
+                title: "Disable Smart Control"
+
+  - id: battery_disable_via_notification
+    alias: "Battery | Disable via Notification"
+    trigger:
+      - platform: event
+        event_type: mobile_app_notification_action
+        event_data:
+          action: "DISABLE_BATTERY_CONTROL"
+    action:
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.battery_smart_control_enabled
+
+  - id: battery_cache_today_solar_forecast
+    alias: "Battery | Cache Today's Solcast Forecast at Midnight"
+    description: >
+      Stores today's Solcast p50 forecast at 00:00:30 so it can be compared
+      against actual production at 22:00 to update the accuracy ratio.
+    trigger:
+      - platform: time
+        at: "00:00:30"
+    condition:
+      - condition: template
+        value_template: >
+          {{ states('sensor.solcast_pv_forecast_forecast_today')
+             not in ['unavailable', 'unknown', 'none', 'None', ''] }}
+    action:
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_solcast_today_forecast_cached
+        data:
+          value: >
+            {{ states('sensor.solcast_pv_forecast_forecast_today') | float(0) | round(2) }}
+
+  - id: battery_update_solar_accuracy
+    alias: "Battery | Update Solar Forecast Accuracy Ratio"
+    description: >
+      At 22:00, compares today's actual solar production against today's
+      Solcast p50 forecast (cached at midnight) and updates the rolling
+      accuracy ratio with exponential smoothing (alpha=0.3). The ratio is
+      applied in pyscript to correct tomorrow's headroom calculation.
+      Set input_text.battery_solar_actual_sensor to your inverter's daily
+      energy sensor entity ID.
+    trigger:
+      - platform: time
+        at: "22:00:00"
+    condition:
+      - condition: template
+        value_template: >
+          {{ states('input_number.battery_solcast_today_forecast_cached') | float(0) > 0.5 }}
+    action:
+      - variables:
+          forecast_kwh: "{{ states('input_number.battery_solcast_today_forecast_cached') | float(0) }}"
+          current_ratio: "{{ states('input_number.battery_solar_forecast_accuracy') | float(1.0) }}"
+          actual_kwh: >
+            {{ states(states('input_text.battery_solar_actual_sensor')) | float(-1) }}
+      - condition: template
+        value_template: "{{ actual_kwh >= 0 and forecast_kwh > 0.5 }}"
+      - variables:
+          today_ratio: "{{ [actual_kwh / forecast_kwh, 2.0] | min | round(3) }}"
+          new_ratio: "{{ (0.3 * today_ratio + 0.7 * current_ratio) | round(3) }}"
+          clamped_ratio: "{{ [[new_ratio, 0.3] | max, 1.2] | min | round(3) }}"
+      - service: input_number.set_value
+        target:
+          entity_id: input_number.battery_solar_forecast_accuracy
+        data:
+          value: "{{ clamped_ratio }}"
+      - action: script.battery_notify
+        data:
+          title: "☀️ Solar Accuracy Updated"
+          message: >
+            Forecast: {{ forecast_kwh | round(1) }} kWh · Actual: {{ actual_kwh | round(1) }} kWh
+            Today ratio: {{ (today_ratio * 100) | round(0) | int }}%
+            Smoothed ratio: {{ (clamped_ratio * 100) | round(0) | int }}%

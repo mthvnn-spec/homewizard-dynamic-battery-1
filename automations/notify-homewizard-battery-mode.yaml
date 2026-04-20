@@ -1,0 +1,51 @@
+"""
+Automation: Notify HomeWizard battery mode changes
+Sends a mobile notification whenever the battery group mode changes.
+Includes current charge/discharge rate and a short rationale for the
+chosen action derived from the same sensors and thresholds used by
+the main automation.
+"""
+
+alias: HomeWizard Battery Mode Notification
+description: >
+  Notify mobile when the battery mode changes with current rate and the
+  rationale for charging/discharging.
+
+trigger:
+  - platform: state
+    entity_id: select.p1_meter_batterijgroepmodus
+
+variables:
+  current: "{{ states('sensor.entso_e_current_electricity_market_price') | float(0) }}"
+  lowest: "{{ states('sensor.entso_e_lowest_energy_price') | float(0) }}"
+  highest: "{{ states('sensor.entso_e_highest_energy_price') | float(0) }}"
+  low_margin: 0.03
+  spread: "{{ (highest - lowest) | float(0) }}"
+  high_margin: "{{ (spread / 2.5) | float(0) }}"
+  low_threshold: "{{ lowest + low_margin }}"
+  high_threshold: "{{ highest - high_margin }}"
+  soc: "{{ states('sensor.plug_in_battery_laadpercentage') | float(0) }}"
+  export_power: "{{ states('sensor.p1_export_power') | float(0) }}"
+  import_power: "{{ states('sensor.p1_import_power') | float(0) }}"
+  min_export_power: 0.05
+
+action:
+  - service: notify.notify
+    data:
+      title: "Battery mode: {{ trigger.to_state.state }}"
+      message: >-
+        {% set mode = trigger.to_state.state %}
+        {% set rate = (export_power if export_power | float(0) > 0 else import_power) | round(2) %}
+        {% if mode == 'to_full' %}
+        Charging (to_full). Rate: {{ rate }} kW. Rationale: Charging from grid because price {{ current }} ≤ low_threshold (cheap).
+        {% elif mode == 'zero' and export_power | float(0) > min_export_power %}
+        Charging (absorbing PV surplus). Rate: {{ rate }} kW. Rationale: PV export detected ({{ export_power }} kW), battery set to absorb surplus.
+        {% elif mode == 'zero' and current | float(0) > high_threshold | float(0) %}
+        Discharging. Rate: {{ rate }} kW. Rationale: Market price {{ current }} > high_threshold (expensive) — discharging to sell at higher price.
+        {% elif mode == 'standby' %}
+        Idle (standby). Rate: {{ rate }} kW. Rationale: Battery left idle due to heavy load, non-profitable arbitrage, or constrained conditions.
+        {% else %}
+        Mode: {{ mode }}. Rate: {{ rate }} kW. Rationale: Determined by current price/load/export conditions.
+        {% endif %}
+
+mode: single
