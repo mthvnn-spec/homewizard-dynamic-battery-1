@@ -978,6 +978,16 @@ automation:
           title: "🔋 Battery Smart Control → OFF"
           message: "Returned to hold mode."
 
+  - id: battery_enable_saldering_on_startup
+    alias: "Battery | Enable Saldering on Startup"
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.battery_saldering_enabled
+
   - id: battery_soc_sensor_validation
     alias: "Battery | SOC Sensor Validation"
     trigger:
