@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,25 +102,8 @@ def _detail_slot_strings(slots, today_str):
     return out[:255]
 
 
-def _slot_hour(slot_time):
-    return int(slot_time[11:13])
-
-
-def _slot_date(slot_time):
-    return slot_time[:10]
-
-
 def _to_u(kwh, soc_unit):
     return int(round(float(kwh) / float(soc_unit)))
-
-
-def _is_overnight_before_morning(slot_time, today_str, tomorrow_str, morning_peak_end_hour):
-    hh = _slot_hour(slot_time)
-    d = _slot_date(slot_time)
-    return (
-        (d == today_str and hh >= 18)
-        or (d == tomorrow_str and hh < morning_peak_end_hour)
-    )
 
 
 def _percentile(sorted_values, fraction):
@@ -128,6 +111,40 @@ def _percentile(sorted_values, fraction):
         return 0.0
     idx = max(0, min(len(sorted_values) - 1, int(len(sorted_values) * fraction)))
     return sorted_values[idx]
+
+
+# ---------------------------------------------------------------------------
+# Time-of-day load profile (96 quarters: q = hour*4 + minute//15)
+# Stored as two fixed-width strings (48 quarters * 4 digits = 192 chars each):
+#   input_text.battery_load_profile_am  (00:00 .. 11:45)
+#   input_text.battery_load_profile_pm  (12:00 .. 23:45)
+# ---------------------------------------------------------------------------
+
+def _parse_half_profile(raw, n=48):
+    if not raw or len(raw) < n * 4:
+        return [0] * n
+    try:
+        return [int(raw[i * 4:(i + 1) * 4]) for i in range(n)]
+    except Exception:
+        return [0] * n
+
+
+def _parse_load_profile(raw_am, raw_pm):
+    return _parse_half_profile(raw_am, 48) + _parse_half_profile(raw_pm, 48)
+
+
+def _format_load_profile(arr):
+    safe = [max(0, min(9999, int(round(w)))) for w in arr[:96]]
+    am = "".join(f"{w:04d}" for w in safe[:48])
+    pm = "".join(f"{w:04d}" for w in safe[48:96])
+    return am, pm
+
+
+def _quarter_of_day(iso_ts):
+    # iso_ts like "2026-04-22T13:15:00"
+    h = int(iso_ts[11:13])
+    m = int(iso_ts[14:16])
+    return h * 4 + (m // 15)
 
 
 # ---------------------------------------------------------------------------
@@ -141,17 +158,15 @@ def _dp_optimize(
     max_charge_slot_kwh,
     charge_gain_kwh,
     charge_efficiency_to_battery,
-    max_discharge_slot_kwh,
-    discharge_delivery_kwh,
+    discharge_batt_kwh_by_slot,
+    discharge_delivery_kwh_by_slot,
     discharge_efficiency_from_battery,
-    charge_cap_by_slot,
-    required_margin,
     min_soc_floor_kwh,
 ):
     """
-    DP over future 15-min slots.
+    DP over future 15-min slots with per-slot discharge rate.
     - charge cost uses actual grid kWh drawn (max_charge_slot_kwh / charge_efficiency)
-    - discharge revenue uses delivered kWh after discharge efficiency
+    - discharge battery-side kWh + delivered kWh vary per slot (from time-of-day load profile)
     - terminal value at 20th-percentile price for residual SOC above floor
     """
     N = len(prices)
@@ -165,7 +180,7 @@ def _dp_optimize(
 
     capacity_u = _to_u(capacity_kwh, SOC_UNIT)
     charge_gain_u = max(_to_u(charge_gain_kwh, SOC_UNIT), 1)
-    discharge_u = max(_to_u(max_discharge_slot_kwh, SOC_UNIT), 1)
+    discharge_u_by_slot = [max(_to_u(k, SOC_UNIT), 1) for k in discharge_batt_kwh_by_slot]
     init_u = max(0, min(capacity_u, _to_u(initial_soc_kwh, SOC_UNIT)))
     floor_u = _to_u(min_soc_floor_kwh, SOC_UNIT)
 
@@ -175,18 +190,21 @@ def _dp_optimize(
     V = [max(0, s - floor_u) * terminal_value_per_u for s in range(NSTATES)]
     policy_stack = []
 
+    avg_d_u = sum(discharge_u_by_slot) / max(1, len(discharge_u_by_slot))
     _log_info(
         f"dp N={N} cap_u={capacity_u} states={NSTATES} "
         f"terminal_price={terminal_price:.4f} "
         f"terminal_val_per_u={terminal_value_per_u:.5f} "
-        f"delivery_kwh={discharge_delivery_kwh:.4f}"
+        f"avg_discharge_u={avg_d_u:.2f}"
     )
 
+    # DP maximizes RAW economic value; margin/spread/value checks are
+    # applied post-hoc in _build_schedule's `profitable` gate.
     for t in range(N - 1, -1, -1):
         price = float(prices[t]["price"])
         c_cost = (max_charge_slot_kwh / charge_efficiency_to_battery) * price
-        d_rev = discharge_delivery_kwh * price - (discharge_delivery_kwh * required_margin)
-        cap_u = min(_to_u(charge_cap_by_slot[t], SOC_UNIT), capacity_u)
+        d_rev = discharge_delivery_kwh_by_slot[t] * price
+        d_u = discharge_u_by_slot[t]
 
         new_V = [0.0] * NSTATES
         new_pol = [0] * NSTATES
@@ -195,14 +213,14 @@ def _dp_optimize(
             best = V[s]
             best_a = 0
 
-            if s < cap_u:
-                sc = min(s + charge_gain_u, cap_u)
+            if s < capacity_u:
+                sc = min(s + charge_gain_u, capacity_u)
                 vc = V[sc] - c_cost
                 if vc > best:
                     best, best_a = vc, 1
 
-            if s - discharge_u >= floor_u:
-                sd = s - discharge_u
+            if s - d_u >= floor_u:
+                sd = s - d_u
                 vd = V[sd] + d_rev
                 if vd > best:
                     best, best_a = vd, 2
@@ -221,19 +239,26 @@ def _dp_optimize(
         act = policy_stack[t][s]
         actions.append(act)
         if act == 1:
-            cap_u = min(_to_u(charge_cap_by_slot[t], SOC_UNIT), capacity_u)
-            s = min(s + charge_gain_u, cap_u)
+            s = min(s + charge_gain_u, capacity_u)
         elif act == 2:
-            s = max(s - discharge_u, 0)
+            s = max(s - discharge_u_by_slot[t], 0)
 
-    actual_value = 0.0
+    # cycle_value = pure charge/discharge cashflows (no terminal). Used to
+    # compute the per-kWh margin so it isn't inflated by leftover SOC value.
+    cycle_value = 0.0
     for t in range(N):
         if actions[t] == 1:
-            actual_value -= (max_charge_slot_kwh / charge_efficiency_to_battery) * float(prices[t]["price"])
+            cycle_value -= (max_charge_slot_kwh / charge_efficiency_to_battery) * float(prices[t]["price"])
         elif actions[t] == 2:
-            actual_value += discharge_delivery_kwh * float(prices[t]["price"])
+            cycle_value += discharge_delivery_kwh_by_slot[t] * float(prices[t]["price"])
 
-    return actions, actual_value
+    # total_value adds terminal value of SOC above the floor so the
+    # profitability gate sees the same number the DP optimized for.
+    terminal_above_floor_kwh = max(0, s - floor_u) * SOC_UNIT
+    terminal_value = terminal_above_floor_kwh * float(discharge_efficiency_from_battery) * terminal_price
+    total_value = cycle_value + terminal_value
+
+    return actions, cycle_value, total_value
 
 
 # ---------------------------------------------------------------------------
@@ -245,54 +270,25 @@ def _build_schedule(
     soc,
     capacity_kwh,
     max_charge_slot_kwh,
-    max_discharge_slot_kwh,
+    discharge_batt_kwh_by_slot,
+    discharge_delivery_kwh_by_slot,
     charge_efficiency_to_battery,
     discharge_efficiency_from_battery,
     min_profit,
     safety_margin,
     min_total_value,
     min_price_spread,
-    today_str,
-    tomorrow_str,
-    morning_reserve_fraction,
-    morning_reserve_min_slots,
-    morning_peak_end_hour,
-    solar_forecast_tomorrow_kwh,
     min_discharge_soc,
 ):
     required_margin = float(min_profit) + float(safety_margin)
     start_energy_kwh = max(
         0.0, min(float(capacity_kwh), (float(soc) / 100.0) * float(capacity_kwh))
     )
-    charge_gain_kwh = float(max_charge_slot_kwh) * float(charge_efficiency_to_battery)
-    discharge_delivery_kwh = float(max_discharge_slot_kwh) * float(discharge_efficiency_from_battery)
+    # max_charge_slot_kwh is BATTERY-side energy added per slot (consistent
+    # with discharge convention). Grid-side draw = that / charge_efficiency,
+    # which is what the DP uses for cost.
+    charge_gain_kwh = float(max_charge_slot_kwh)
     min_soc_floor_kwh = float(capacity_kwh) * (float(min_discharge_soc) / 100.0)
-
-    saldering_enabled = _read_bool("input_boolean.battery_saldering_enabled", True)
-    tomorrow_negative_price = any([
-        slot["start_time"][:10] == tomorrow_str and float(slot["price"]) < 0
-        for slot in prices
-    ])
-
-    # Solar headroom only active when saldering is OFF (post-2027) or when
-    # tomorrow has negative prices. While saldering is on, exported solar
-    # earns full import price so keeping the battery empty costs arbitrage profit.
-    solar_headroom_active = (
-        float(solar_forecast_tomorrow_kwh) > 0.8
-        and (not saldering_enabled or tomorrow_negative_price)
-    )
-
-    if solar_headroom_active:
-        # Scale relative to battery capacity
-        solar_scale = min(float(solar_forecast_tomorrow_kwh) / float(capacity_kwh), 1.0)
-        effective_reserve_fraction = float(morning_reserve_fraction) * solar_scale
-        charge_cap_soc = max(10.0, (1.0 - effective_reserve_fraction) * 100.0)
-    else:
-        charge_cap_soc = 100.0
-
-    charge_cap_kwh = float(capacity_kwh) * (charge_cap_soc / 100.0)
-    min_morning_reserve_kwh = float(max_discharge_slot_kwh) * int(morning_reserve_min_slots)
-    overnight_cap_kwh = max(charge_cap_kwh, min_morning_reserve_kwh)
 
     if not prices:
         _log_info("no prices available after parsing cache")
@@ -301,51 +297,43 @@ def _build_schedule(
             "expected_profit": 0.0, "total_expected_value": 0.0,
             "charge_ceiling": 0.0, "discharge_floor": 0.0,
             "price_spread": 0.0, "profitable": False,
-            "charge_cap_soc": 0.0, "charge_cap_kwh": 0.0,
-            "solar_headroom_active": False,
         }
 
-    charge_cap_by_slot = []
-    for slot in prices:
-        if solar_headroom_active and _is_overnight_before_morning(
-            slot["start_time"], today_str, tomorrow_str, int(morning_peak_end_hour)
-        ):
-            charge_cap_by_slot.append(overnight_cap_kwh)
-        else:
-            charge_cap_by_slot.append(float(capacity_kwh))
-
-    actions, actual_value = _dp_optimize(
+    actions, cycle_value, total_value = _dp_optimize(
         prices=prices,
         initial_soc_kwh=start_energy_kwh,
         capacity_kwh=float(capacity_kwh),
         max_charge_slot_kwh=float(max_charge_slot_kwh),
         charge_gain_kwh=charge_gain_kwh,
         charge_efficiency_to_battery=float(charge_efficiency_to_battery),
-        max_discharge_slot_kwh=float(max_discharge_slot_kwh),
-        discharge_delivery_kwh=discharge_delivery_kwh,
+        discharge_batt_kwh_by_slot=discharge_batt_kwh_by_slot,
+        discharge_delivery_kwh_by_slot=discharge_delivery_kwh_by_slot,
         discharge_efficiency_from_battery=float(discharge_efficiency_from_battery),
-        charge_cap_by_slot=charge_cap_by_slot,
-        required_margin=required_margin,
         min_soc_floor_kwh=min_soc_floor_kwh,
     )
 
     charge_slots = []
     discharge_slots = []
+    total_discharge_delivery = 0.0
     for i, act in enumerate(actions):
         if act == 1:
             charge_slots.append({"start_time": prices[i]["start_time"], "price": prices[i]["price"]})
         elif act == 2:
             discharge_slots.append({"start_time": prices[i]["start_time"], "price": prices[i]["price"]})
+            total_discharge_delivery += discharge_delivery_kwh_by_slot[i]
 
     n_discharge = len(discharge_slots)
-    total_expected_value = actual_value
+    total_expected_value = total_value  # includes terminal SOC value (for gating)
 
+    # Per-kWh margin from cycle cashflows only, so it's not inflated by
+    # residual SOC value when the plan ends with energy still in the battery.
     expected_profit = (
-        total_expected_value / (n_discharge * discharge_delivery_kwh)
-        if n_discharge > 0 and discharge_delivery_kwh > 0 else 0.0
+        cycle_value / total_discharge_delivery
+        if total_discharge_delivery > 0 else 0.0
     )
 
     charge_ceiling = max([s["price"] for s in charge_slots]) if charge_slots else 0.0
+    min_charge_price = min([s["price"] for s in charge_slots]) if charge_slots else 0.0
     discharge_floor = min([s["price"] for s in discharge_slots]) if discharge_slots else 0.0
 
     all_prices_list = [s["price"] for s in prices]
@@ -362,8 +350,7 @@ def _build_schedule(
         f"schedule: charge={len(charge_slots)} discharge={n_discharge} "
         f"total_value={total_expected_value:.4f} expected_profit={expected_profit:.4f} "
         f"price_spread={price_spread:.4f} profitable={profitable} "
-        f"solar_headroom={solar_headroom_active} charge_cap_soc={charge_cap_soc:.1f} "
-        f"discharge_delivery_kwh={discharge_delivery_kwh:.4f}"
+        f"total_discharge_delivery={total_discharge_delivery:.4f}"
     )
 
     return {
@@ -372,12 +359,10 @@ def _build_schedule(
         "expected_profit": round(expected_profit, 4),
         "total_expected_value": round(total_expected_value, 4),
         "charge_ceiling": round(charge_ceiling, 4),
+        "min_charge_price": round(min_charge_price, 4),
         "discharge_floor": round(discharge_floor, 4),
         "price_spread": round(price_spread, 4),
         "profitable": profitable,
-        "charge_cap_soc": round(charge_cap_soc, 1),
-        "charge_cap_kwh": round(charge_cap_kwh, 4),
-        "solar_headroom_active": solar_headroom_active,
     }
 
 
@@ -393,7 +378,6 @@ def battery_schedule_run():
 
         now_dt = datetime.now()
         today_str = now_dt.strftime("%Y-%m-%d")
-        tomorrow_str = (now_dt + timedelta(days=1)).strftime("%Y-%m-%d")
         current_slot = _current_slot_iso(now_dt)
         _set_input_text("input_text.battery_debug_stage", f"time ok {current_slot}")
 
@@ -404,11 +388,24 @@ def battery_schedule_run():
         min_profit = _safe_float(_read_state("input_number.battery_min_profit_threshold", 0.05), 0.05)
         safety_margin = _safe_float(_read_state("input_number.battery_schedule_safety_margin", 0.02), 0.02)
         min_total_value = _safe_float(_read_state("input_number.battery_schedule_min_total_value", 0.03), 0.03)
-        min_discharge_soc = _safe_float(_read_state("input_number.battery_min_discharge_soc", 5), 5)
+        min_discharge_soc = _safe_float(_read_state("input_number.battery_min_discharge_soc", 0), 0)
 
         capacity_kwh = _safe_float(_read_state("input_number.battery_capacity_kwh", 2.7), 2.7)
-        max_charge_slot_kwh = _safe_float(_read_state("input_number.battery_max_charge_slot_kwh", 0.189), 0.189)
-        max_discharge_slot_kwh = _safe_float(_read_state("input_number.battery_max_discharge_slot_kwh", 0.189), 0.189)
+        max_charge_slot_kwh = _safe_float(_read_state("input_number.battery_max_charge_slot_kwh", 0.200), 0.200)
+        max_discharge_slot_kwh = _safe_float(_read_state("input_number.battery_max_discharge_slot_kwh", 0.200), 0.200)
+
+        # Derive realistic discharge cap from observed home load.
+        # In HomeWizard 'zero' mode the battery is load-following: it can
+        # never deliver more than the house is consuming. DP must plan on
+        # the smaller of (battery rated rate, avg home load rate).
+        avg_home_load_w = _safe_float(_read_state("input_number.battery_avg_home_load_w", 400), 400)
+
+        # Time-of-day load profile (96 quarters). Each future price slot gets
+        # its own realistic discharge rate from the bucket matching its
+        # quarter-of-day. Never-sampled buckets fall back to avg_home_load_w.
+        raw_am = str(_read_state("input_text.battery_load_profile_am", "") or "")
+        raw_pm = str(_read_state("input_text.battery_load_profile_pm", "") or "")
+        load_profile_w = _parse_load_profile(raw_am, raw_pm)
 
         charge_efficiency_to_battery = _safe_float(
             _read_state("input_number.battery_charge_efficiency", 0.75), 0.75
@@ -425,30 +422,6 @@ def battery_schedule_run():
         )
 
         _set_input_text("input_text.battery_debug_stage", "inputs ok")
-
-        morning_reserve_fraction = _safe_float(_read_state("input_number.battery_morning_reserve_fraction", 0.35), 0.35)
-        morning_reserve_min_slots = int(_safe_float(_read_state("input_number.battery_morning_reserve_min_slots", 2), 2))
-        morning_peak_end_hour = int(_safe_float(_read_state("input_number.battery_morning_peak_end_hour", 10), 10))
-
-        solar_forecast_tomorrow_kwh = _safe_float(
-            _read_state("input_number.battery_solcast_tomorrow_cached", 0), 0
-        )
-        if solar_forecast_tomorrow_kwh < 0.1:
-            solar_forecast_tomorrow_kwh = _safe_float(
-                _read_state("sensor.solcast_pv_forecast_forecast_tomorrow", 0), 0
-            )
-
-        solar_accuracy_ratio = _safe_float(
-            _read_state("input_number.battery_solar_forecast_accuracy", 1.0), 1.0
-        )
-        if solar_accuracy_ratio != 1.0:
-            raw_forecast = solar_forecast_tomorrow_kwh
-            solar_forecast_tomorrow_kwh = raw_forecast * solar_accuracy_ratio
-            _log_info(
-                f"solar forecast adjusted {raw_forecast:.2f} * {solar_accuracy_ratio:.2f} "
-                f"= {solar_forecast_tomorrow_kwh:.2f} kWh"
-            )
-        _set_input_text("input_text.battery_debug_stage", f"solar ok {solar_forecast_tomorrow_kwh:.2f}")
 
         raw = "".join([
             str(_read_state("input_text.battery_tibber_prices_cache_1", "") or ""),
@@ -468,24 +441,32 @@ def battery_schedule_run():
             live_price = prices[0]["price"] if prices else 0.0
         _set_input_text("input_text.battery_debug_stage", f"live ok {live_price}")
 
+        # Build per-slot discharge capacity from the time-of-day profile.
+        # Each slot's cap = min(battery rated rate, profile[quarter] W).
+        discharge_batt_kwh_by_slot = []
+        discharge_delivery_kwh_by_slot = []
+        for p in prices:
+            q = _quarter_of_day(p["start_time"])
+            w = load_profile_w[q] if 0 <= q < 96 else 0
+            if w < 50:
+                w = avg_home_load_w  # warmup fallback
+            batt_kwh = min(max_discharge_slot_kwh, (w / 1000.0) * 0.25)
+            discharge_batt_kwh_by_slot.append(batt_kwh)
+            discharge_delivery_kwh_by_slot.append(batt_kwh * discharge_efficiency_from_battery)
+
         result = _build_schedule(
             prices=prices,
             soc=soc,
             capacity_kwh=capacity_kwh,
             max_charge_slot_kwh=max_charge_slot_kwh,
-            max_discharge_slot_kwh=max_discharge_slot_kwh,
+            discharge_batt_kwh_by_slot=discharge_batt_kwh_by_slot,
+            discharge_delivery_kwh_by_slot=discharge_delivery_kwh_by_slot,
             charge_efficiency_to_battery=charge_efficiency_to_battery,
             discharge_efficiency_from_battery=discharge_efficiency_from_battery,
             min_profit=min_profit,
             safety_margin=safety_margin,
             min_total_value=min_total_value,
             min_price_spread=min_price_spread,
-            today_str=today_str,
-            tomorrow_str=tomorrow_str,
-            morning_reserve_fraction=morning_reserve_fraction,
-            morning_reserve_min_slots=morning_reserve_min_slots,
-            morning_peak_end_hour=morning_peak_end_hour,
-            solar_forecast_tomorrow_kwh=solar_forecast_tomorrow_kwh,
             min_discharge_soc=min_discharge_soc,
         )
         _set_input_text(
@@ -507,19 +488,24 @@ def battery_schedule_run():
         _set_input_text("input_text.battery_discharge_slots_detail", _detail_slot_strings(result["discharge_slots"], today_str))
 
         profitable = bool(result["profitable"])
-        enough_energy_now = ((soc / 100.0) * capacity_kwh) >= (max_discharge_slot_kwh * 0.5)
 
-        soc_below_cap = soc < result["charge_cap_soc"]
+        # Use the current quarter's learned profile bucket for the discharge
+        # gate so it matches what the DP planned for this specific slot.
+        current_q = now_dt.hour * 4 + (now_dt.minute // 15)
+        current_w = load_profile_w[current_q] if 0 <= current_q < 96 else avg_home_load_w
+        if current_w < 50:
+            current_w = avg_home_load_w
+        current_discharge_slot_kwh = min(max_discharge_slot_kwh, (current_w / 1000.0) * 0.25)
+        enough_energy_now = ((soc / 100.0) * capacity_kwh) >= (current_discharge_slot_kwh * 0.5)
+
         is_opportunistic = (
             opportunistic_threshold > 0
             and soc < 100
-            and soc_below_cap
             and live_price >= 0
             and live_price <= opportunistic_threshold
-            and profitable
             and (
-                result["charge_ceiling"] == 0
-                or live_price <= result["charge_ceiling"]
+                not result["charge_slots"]
+                or live_price <= result["min_charge_price"]
             )
         )
 
@@ -542,9 +528,9 @@ def battery_schedule_run():
         if is_cheap:
             target_mode = "to_full"
         elif is_expensive:
-            target_mode = "zero"
+            target_mode = "zero_discharge_only"
         else:
-            target_mode = "zero_charge_only"
+            target_mode = "standby"
 
         if not prices:
             reason = "no future prices"
@@ -565,9 +551,6 @@ def battery_schedule_run():
                 reason = "profit below threshold"
         else:
             reason = "waiting for later slot"
-
-        if result["solar_headroom_active"]:
-            reason = f"{reason} | solar headroom cap {result['charge_cap_soc']:.0f}%"
 
         _set_input_text(
             "input_text.battery_debug_summary",
@@ -595,8 +578,7 @@ def battery_schedule_run():
             f"reason={reason} soc={soc:.1f} live_price={live_price:.4f} "
             f"opportunistic_threshold={opportunistic_threshold:.4f} "
             f"profitable={profitable} charge_count={len(charge_times)} "
-            f"discharge_count={len(discharge_times)} "
-            f"charge_cap_soc={result['charge_cap_soc']:.1f}"
+            f"discharge_count={len(discharge_times)}"
         )
         _log_debug(f"charge_times={charge_times} discharge_times={discharge_times}")
 
@@ -619,11 +601,10 @@ def battery_schedule_run():
                         f"Slots: {len(charge_times)} charge / {len(discharge_times)} discharge\n"
                         f"Expected margin: {round(result['expected_profit'] * 100, 2)} ct/kWh\n"
                         f"Expected schedule value: €{round(result['total_expected_value'], 3)}\n"
-                        f"Charge cap: {round(result['charge_cap_soc'], 0)}%\n"
                         f"{'📅 Cross-day' if has_tomorrow else '📅 Today only'}"
                     ),
                 )
-            elif target_mode == "zero":
+            elif target_mode == "zero_discharge_only":
                 script.battery_notify(
                     title="⚡ Battery → Discharging",
                     message=(
@@ -632,19 +613,17 @@ def battery_schedule_run():
                         f"Slots: {len(charge_times)} charge / {len(discharge_times)} discharge\n"
                         f"Expected margin: {round(result['expected_profit'] * 100, 2)} ct/kWh\n"
                         f"Expected schedule value: €{round(result['total_expected_value'], 3)}\n"
-                        f"Charge cap: {round(result['charge_cap_soc'], 0)}%\n"
                         f"{'📅 Cross-day' if has_tomorrow else '📅 Today only'}"
                     ),
                 )
-            elif last_mode in ["to_full", "zero"]:
+            elif last_mode in ["to_full", "zero", "zero_discharge_only"]:
                 script.battery_notify(
                     title="🔄 Battery → Hold",
                     message=(
                         "No profitable schedule found\n" if not profitable
                         else "Waiting for scheduled slot\n"
                     ) + (
-                        f"SOC: {int(soc)}% · Slots: {len(charge_times)} charge / {len(discharge_times)} discharge\n"
-                        f"Charge cap: {round(result['charge_cap_soc'], 0)}%"
+                        f"SOC: {int(soc)}% · Slots: {len(charge_times)} charge / {len(discharge_times)} discharge"
                     ),
                 )
 
@@ -654,3 +633,242 @@ def battery_schedule_run():
         _set_input_text("input_text.battery_debug_error", str(e))
         _set_input_text("input_text.battery_debug_stage", "crashed")
         raise
+
+
+# ---------------------------------------------------------------------------
+# Load profile sampler
+# ---------------------------------------------------------------------------
+
+@service
+def battery_sample_load():
+    """
+    Samples home load and updates:
+      - the 96-step time-of-day profile bucket (EMA a=0.1)
+      - the scalar battery_avg_home_load_w (EMA a=0.1) as a warmup fallback
+
+    Sources depending on battery mode (solar production is always added so we
+    capture true home consumption, not just net grid draw):
+      - standby (idle):          home load = p1_meter_power + solar_W
+      - zero (discharging):      home load = p1_meter_power + |battery_power| + solar_W
+      - to_full (charging):      skipped (p1 mixes home load with grid charge)
+    The 30 < load < 1500 W filter rejects export-dominated samples and
+    EV-charging / heat-pump spikes.
+    """
+    try:
+        if not _read_bool("input_boolean.battery_smart_control_enabled", True):
+            return
+        mode = str(_read_state("input_text.battery_last_mode", "") or "")
+
+        # Solar production in W (sensor reports kW). The Envoy updates only
+        # every few minutes, so accept the most recent value as long as it's
+        # fresh within a reasonable window. If the sensor is stale or
+        # unavailable, assume 0 W (safe underestimate of home load).
+        solar_w = 0.0
+        solar_raw = _read_state("sensor.envoy_122041077462_current_power_production", None)
+        solar_kw = _safe_float(solar_raw, None)
+        if solar_kw is not None:
+            # Check staleness via last_updated attribute; skip if > 15 min old
+            try:
+                lu = state.get("sensor.envoy_122041077462_current_power_production.last_updated")
+                if lu is not None:
+                    # lu is a tz-aware datetime (UTC) from pyscript state metadata
+                    age = (datetime.now(timezone.utc) - lu).total_seconds()
+                    if age <= 900:
+                        solar_w = max(0.0, solar_kw * 1000.0)
+                else:
+                    solar_w = max(0.0, solar_kw * 1000.0)
+            except Exception:
+                solar_w = max(0.0, solar_kw * 1000.0)
+
+        load_w = None
+        if mode in ("standby", "zero_charge_only"):
+            p1 = _safe_float(_read_state("sensor.p1_meter_power", None), None)
+            if p1 is None:
+                return
+            # home_load = net_grid + solar (p1>0 import, p1<0 export)
+            w = p1 + solar_w
+            if w <= 30 or w >= 1500:
+                return
+            load_w = w
+        elif mode in ("zero", "zero_discharge_only"):
+            bp = _safe_float(_read_state("sensor.plug_in_battery_power", None), None)
+            if bp is None:
+                return
+            # In zero mode the battery is load-following. True home load =
+            # net grid import (p1, positive = import) + battery discharge + solar.
+            # p1 can be slightly negative if the battery momentarily over-delivers.
+            p1 = _safe_float(_read_state("sensor.p1_meter_power", None), 0.0)
+            w = p1 + abs(bp) + solar_w
+            if w <= 30 or w >= 1500:
+                return
+            load_w = w
+        else:
+            return
+
+        now_dt = datetime.now()
+        q = now_dt.hour * 4 + (now_dt.minute // 15)
+
+        raw_am = str(_read_state("input_text.battery_load_profile_am", "") or "")
+        raw_pm = str(_read_state("input_text.battery_load_profile_pm", "") or "")
+        profile = _parse_load_profile(raw_am, raw_pm)
+
+        alpha = 0.1
+        current = profile[q] if 0 <= q < 96 else 0
+        if current <= 0:
+            new_val = int(round(load_w))
+        else:
+            new_val = int(round(current + alpha * (load_w - current)))
+        profile[q] = new_val
+
+        am, pm = _format_load_profile(profile)
+        _set_input_text("input_text.battery_load_profile_am", am)
+        _set_input_text("input_text.battery_load_profile_pm", pm)
+
+        # Scalar EMA fallback
+        avg = _safe_float(_read_state("input_number.battery_avg_home_load_w", 400), 400)
+        new_avg = (1 - alpha) * avg + alpha * load_w
+        new_avg = max(50.0, min(3000.0, new_avg))
+        _set_input_number("input_number.battery_avg_home_load_w", new_avg)
+
+    except Exception as e:
+        _log_info(f"sample_load error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Load profile seed / reset
+# ---------------------------------------------------------------------------
+
+@service
+def battery_reset_load_profile(seed_w=None):
+    """
+    Initialise (or reset) both load-profile helpers to a flat profile.
+
+    seed_w: watts to use for every bucket. Defaults to the current
+            battery_avg_home_load_w value. Pass 0 to clear the profile.
+
+    Call this once from Developer Tools → Services after first install, or
+    whenever you want to wipe the learned curve and start fresh.
+    """
+    try:
+        if seed_w is None:
+            seed_w = _safe_float(
+                _read_state("input_number.battery_avg_home_load_w", 400), 400
+            )
+        seed_w = max(0.0, min(9999.0, float(seed_w)))
+        flat = [int(round(seed_w))] * 96
+        am, pm = _format_load_profile(flat)
+        _set_input_text("input_text.battery_load_profile_am", am)
+        _set_input_text("input_text.battery_load_profile_pm", pm)
+        _log_info(f"reset_load_profile: seeded all 96 buckets at {seed_w:.0f} W")
+    except Exception as e:
+        _log_info(f"reset_load_profile error: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Cheapest price windows (for markdown dashboard card)
+# ---------------------------------------------------------------------------
+
+def _read_price_cache():
+    """Concatenate the 5 price-cache chunks into the raw compact string."""
+    parts = []
+    for i in range(1, 6):
+        chunk = _read_state(f"input_text.battery_tibber_prices_cache_{i}", "") or ""
+        if chunk in ["unknown", "unavailable", "none", "None"]:
+            continue
+        parts.append(chunk)
+    return "".join(parts)
+
+
+def _best_window(values_ct, start_ts, start_idx, width_slots, horizon_slots):
+    """
+    Find the cheapest contiguous window of `width_slots` quarters within
+    [start_idx, start_idx + horizon_slots) of `values_ct` (integer ct*10000).
+    Returns dict {s,e,p} with ISO-strings and avg EUR/kWh, or empty placeholder.
+    """
+    n = len(values_ct)
+    end = min(start_idx + horizon_slots, n)
+    best_sum = None
+    best_idx = -1
+    last_start = end - width_slots
+    if last_start < start_idx:
+        return {"s": "", "e": "", "p": 0}
+
+    # Sliding window sum
+    window_sum = sum(values_ct[start_idx:start_idx + width_slots])
+    best_sum = window_sum
+    best_idx = start_idx
+    for i in range(start_idx + 1, last_start + 1):
+        window_sum += values_ct[i + width_slots - 1] - values_ct[i - 1]
+        if window_sum < best_sum:
+            best_sum = window_sum
+            best_idx = i
+
+    s_dt = start_ts + timedelta(minutes=15 * best_idx)
+    e_dt = s_dt + timedelta(minutes=15 * width_slots)
+    avg_eur = (best_sum / width_slots) / 10000.0
+    return {
+        "s": s_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "e": e_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "p": round(avg_eur, 5),
+    }
+
+
+@service
+def battery_compute_price_windows():
+    """
+    For each N in [1,2,3,4] hours, find the cheapest contiguous window
+    within the next 6h / 24h / 48h and write to
+    input_text.tibber_window_{N}h as JSON:
+      {"6h":{"s":ISO,"e":ISO,"p":EUR/kWh}, "24h":{...}, "48h":{...}}
+    """
+    try:
+        import json
+
+        raw = _read_price_cache()
+        if ";" not in raw:
+            return
+        start_str, prices_str = raw.split(";", 1)
+        if len(start_str) != 16:
+            return
+        try:
+            start_ts = datetime.strptime(start_str, "%Y-%m-%dT%H:%M")
+        except Exception:
+            return
+
+        values_ct = []
+        for token in prices_str.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                values_ct.append(int(token))
+            except Exception:
+                continue
+        if not values_ct:
+            return
+
+        now_dt = datetime.now()
+        start_idx = int((now_dt - start_ts).total_seconds() // 900)
+        if start_idx < 0:
+            start_idx = 0
+        if start_idx >= len(values_ct):
+            return
+
+        horizons = {"6h": 24, "24h": 96, "48h": 192}
+        sizes = [1, 2, 3, 4]
+        empty = {"s": "", "e": "", "p": 0}
+
+        for h in sizes:
+            width = h * 4
+            out = {}
+            for hk, hslots in horizons.items():
+                if hslots < width:
+                    out[hk] = empty
+                    continue
+                out[hk] = _best_window(values_ct, start_ts, start_idx, width, hslots)
+            _set_input_text(f"input_text.tibber_window_{h}h", json.dumps(out, separators=(",", ":")))
+
+    except Exception as e:
+        _log_info(f"compute_price_windows error: {e}")
+
+
